@@ -1,0 +1,18 @@
+@baseUrl = {{$dotenv API_URL}}
+
+### Get all categories
+GET {{baseUrl}}/categories
+
+### Get category by id
+GET {{baseUrl}}/categories/1
+
+
+### Create category
+POST {{baseUrl}}/categories
+Content-Type: application/json
+
+{
+  "name": "Gloves"
+}
+
+
