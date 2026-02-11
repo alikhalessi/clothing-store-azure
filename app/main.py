@@ -15,7 +15,7 @@ from jose import jwt, JWTError
 from dotenv import load_dotenv
 
 # -----------------------------
-# Load .env reliably (fixes your 500 DATABASE_URL missing)
+# Load .env reliably
 # app/main.py -> project root is two levels up
 # -----------------------------
 ENV_PATH = Path(__file__).resolve().parents[1] / ".env"
@@ -37,7 +37,6 @@ bearer = HTTPBearer(auto_error=False)
 # -----------------------------
 def require_database_url() -> str:
     if not DATABASE_URL:
-        # Return exactly the kind of message you saw in Swagger
         raise HTTPException(
             status_code=500,
             detail="DATABASE_URL is missing. Put it in .env and run uvicorn with --env-file .env",
@@ -68,7 +67,7 @@ def verify_password(plain: str, hashed: str) -> bool:
 def create_access_token(subject: str, role: str, email: str) -> str:
     expire = datetime.now(timezone.utc) + timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES)
     payload = {
-        "sub": subject,     # customer_id as string
+        "sub": subject,  # customer_id as string
         "role": role,
         "email": email,
         "exp": expire,
@@ -161,7 +160,6 @@ class OrderOut(BaseModel):
 
 
 class UserRegister(BaseModel):
-    # Swagger shows all these fields; we'll accept them safely
     name: Optional[str] = None
     first_name: Optional[str] = None
     last_name: Optional[str] = None
@@ -250,10 +248,17 @@ def list_products():
         return cur.fetchall()
 
 
-# Admin CRUD (optional / extra)
+# -----------------------------
+# Admin product CRUD
+# -----------------------------
 @app.post("/products", status_code=201)
 def create_product(data: ProductCreate, _: Dict[str, Any] = Depends(require_admin)):
     with get_conn() as conn, conn.cursor() as cur:
+        # Prevent ugly 500 (FK violation) -> return clear 400 instead
+        cur.execute("SELECT 1 FROM categories WHERE category_id = %s;", (data.category_id,))
+        if not cur.fetchone():
+            raise HTTPException(status_code=400, detail=f"Invalid category_id: {data.category_id}")
+
         cur.execute(
             """
             INSERT INTO products (name, category_id, price, stock)
@@ -274,6 +279,12 @@ def patch_product(product_id: int, data: ProductPatch, _: Dict[str, Any] = Depen
         fields.append("name = %s")
         values.append(data.name)
     if data.category_id is not None:
+        # Prevent ugly 500 (FK violation) -> return clear 400 instead
+        with get_conn() as conn, conn.cursor() as cur:
+            cur.execute("SELECT 1 FROM categories WHERE category_id = %s;", (data.category_id,))
+            if not cur.fetchone():
+                raise HTTPException(status_code=400, detail=f"Invalid category_id: {data.category_id}")
+
         fields.append("category_id = %s")
         values.append(data.category_id)
     if data.price is not None:
@@ -317,7 +328,6 @@ def delete_product(product_id: int, _: Dict[str, Any] = Depends(require_admin)):
 # -----------------------------
 @app.post("/users", response_model=UserOut, status_code=201)
 def register_user(payload: UserRegister):
-    # Build first/last name from payload
     first_name = (payload.first_name or "").strip()
     last_name = (payload.last_name or "").strip()
 
@@ -341,12 +351,9 @@ def register_user(payload: UserRegister):
 
     with get_conn() as conn:
         with conn.cursor() as cur:
-            # Ensure optional columns exist (otherwise you get 500)
-            # If columns already exist, this does nothing.
             cur.execute("ALTER TABLE customers ADD COLUMN IF NOT EXISTS password VARCHAR(255);")
             cur.execute("ALTER TABLE customers ADD COLUMN IF NOT EXISTS role VARCHAR(50) DEFAULT 'customer';")
 
-            # Email uniqueness check
             cur.execute("SELECT customer_id FROM customers WHERE email = %s;", (payload.email,))
             if cur.fetchone():
                 raise HTTPException(status_code=409, detail="Email already registered.")
@@ -367,7 +374,6 @@ def register_user(payload: UserRegister):
 @app.post("/users/login", response_model=TokenOut)
 def login_user(payload: UserLogin):
     with get_conn() as conn, conn.cursor() as cur:
-        # Expect columns password + role exist when auth is enabled
         cur.execute(
             """
             SELECT customer_id, email, password, role
@@ -407,14 +413,12 @@ def delete_user(customer_id: int, _: Dict[str, Any] = Depends(require_admin)):
 # -----------------------------
 @app.post("/orders", response_model=OrderOut, status_code=201)
 def create_order(payload: OrderCreate, user: Dict[str, Any] = Depends(get_current_user)):
-    # If not admin, force user_id to match token user
     if user["role"] != "admin" and payload.user_id != user["customer_id"]:
         raise HTTPException(status_code=403, detail="You can only place orders for yourself.")
 
     with get_conn() as conn:
         try:
             with conn.cursor() as cur:
-                # Ensure customer exists
                 cur.execute(
                     "SELECT customer_id FROM customers WHERE customer_id = %s;",
                     (payload.user_id,),
@@ -422,7 +426,6 @@ def create_order(payload: OrderCreate, user: Dict[str, Any] = Depends(get_curren
                 if not cur.fetchone():
                     raise HTTPException(status_code=404, detail="Customer not found")
 
-                # Lock product row to safely decrease stock
                 cur.execute(
                     """
                     SELECT product_id, name, price, stock
@@ -442,7 +445,6 @@ def create_order(payload: OrderCreate, user: Dict[str, Any] = Depends(get_curren
                         detail=f"Not enough stock. Available={product['stock']}, requested={payload.quantity}",
                     )
 
-                # Create order
                 cur.execute(
                     """
                     INSERT INTO orders (customer_id)
@@ -453,7 +455,6 @@ def create_order(payload: OrderCreate, user: Dict[str, Any] = Depends(get_curren
                 )
                 order = cur.fetchone()
 
-                # Insert order item (store current price as unit_price)
                 cur.execute(
                     """
                     INSERT INTO order_items (order_id, product_id, quantity, unit_price)
@@ -464,7 +465,6 @@ def create_order(payload: OrderCreate, user: Dict[str, Any] = Depends(get_curren
                 )
                 item = cur.fetchone()
 
-                # Decrease stock
                 cur.execute(
                     "UPDATE products SET stock = stock - %s WHERE product_id = %s;",
                     (payload.quantity, payload.product_id),
@@ -508,9 +508,7 @@ def list_orders(
 
     with get_conn() as conn, conn.cursor() as cur:
         if all and user["role"] == "admin":
-            cur.execute(
-                "SELECT order_id, customer_id, order_date FROM orders ORDER BY order_id DESC;"
-            )
+            cur.execute("SELECT order_id, customer_id, order_date FROM orders ORDER BY order_id DESC;")
         else:
             cur.execute(
                 """
@@ -559,23 +557,25 @@ def list_orders(
 # -----------------------------
 # Required: statistics (SQL aggregates + joins)
 # Protected as ADMIN in optional auth mode
+# FIX #3: Use INNER JOINs (assignment requirement wording)
 # -----------------------------
 @app.get("/statistics/users")
 def stats_users(_: Dict[str, Any] = Depends(require_admin)):
     sql = """
     SELECT
-      c.customer_id AS user_id,
-      c.first_name,
-      c.last_name,
-      COUNT(DISTINCT o.order_id) AS order_count,
-      COALESCE(SUM(oi.quantity), 0) AS items_bought,
-      COALESCE(SUM(oi.quantity * oi.unit_price), 0) AS money_spent
+        c.customer_id AS user_id,
+        c.first_name,
+        c.last_name,
+        COUNT(DISTINCT o.order_id) AS order_count,
+        SUM(oi.quantity) AS items_bought,
+        SUM(oi.quantity * oi.unit_price) AS money_spent
     FROM customers c
-    LEFT JOIN orders o ON o.customer_id = c.customer_id
-    LEFT JOIN order_items oi ON oi.order_id = o.order_id
+    JOIN orders o ON o.customer_id = c.customer_id
+    JOIN order_items oi ON oi.order_id = o.order_id
     GROUP BY c.customer_id, c.first_name, c.last_name
     ORDER BY money_spent DESC, order_count DESC;
     """
+
     with get_conn() as conn, conn.cursor() as cur:
         cur.execute(sql)
         return cur.fetchall()
@@ -585,16 +585,17 @@ def stats_users(_: Dict[str, Any] = Depends(require_admin)):
 def stats_products(_: Dict[str, Any] = Depends(require_admin)):
     sql = """
     SELECT
-      p.product_id,
-      p.name,
-      COUNT(DISTINCT oi.order_id) AS order_count,
-      COALESCE(SUM(oi.quantity), 0) AS units_sold,
-      COALESCE(SUM(oi.quantity * oi.unit_price), 0) AS turnover
+        p.product_id,
+        p.name,
+        COUNT(DISTINCT oi.order_id) AS order_count,
+        SUM(oi.quantity) AS units_sold,
+        SUM(oi.quantity * oi.unit_price) AS turnover
     FROM products p
-    LEFT JOIN order_items oi ON oi.product_id = p.product_id
+    JOIN order_items oi ON oi.product_id = p.product_id
     GROUP BY p.product_id, p.name
     ORDER BY turnover DESC, units_sold DESC;
     """
+
     with get_conn() as conn, conn.cursor() as cur:
         cur.execute(sql)
         return cur.fetchall()
