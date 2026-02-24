@@ -14,6 +14,7 @@ from pydantic import BaseModel, Field
 from jose import jwt, JWTError
 from dotenv import load_dotenv
 
+#
 # -----------------------------
 # Load .env reliably
 # app/main.py -> project root is two levels up
